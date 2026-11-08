@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::io::{Error, Write};
+use std::io::{Error, IsTerminal, Write};
 
 use mumble_protocol as proto;
 use mumble_protocol::client::{Connection, ConnectionOptions, SelfMuteStatus};
 use tauri::{Emitter, Listener, Manager};
 use tauri::ipc::Channel;
 use tauri_plugin_log::fern::{self, colors::ColoredLevelConfig};
-use tauri_plugin_log::{Target, TargetKind};
+use tauri_plugin_log::{Target, TargetKind, TimezoneStrategy};
 use tauri_plugin_store::StoreExt;
 use tokio::sync::{broadcast, watch};
 
@@ -573,6 +573,30 @@ fn stdout_ignoring_errors() -> fern::Dispatch {
     }))
 }
 
+/// The plugin's colored format, `[date][time][LEVEL][target] message`, with
+/// the colors optional. Set per target: the plugin's own format applies to
+/// all targets, so its colors would end up in the log file too.
+fn log_format(
+    colored: bool,
+) -> impl Fn(fern::FormatCallback, &std::fmt::Arguments, &log::Record) + Send + Sync + 'static {
+    move |out, message, record| {
+        let now = TimezoneStrategy::UseUtc.get_now();
+        let level = if colored {
+            ColoredLevelConfig::default().color(record.level()).to_string()
+        } else {
+            record.level().to_string()
+        };
+        out.finish(format_args!(
+            "[{}][{:02}:{:02}:{:02}][{level}][{}] {message}",
+            now.date(),
+            now.hour(),
+            now.minute(),
+            now.second(),
+            record.target(),
+        ))
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // On mobile the plugin's Stdout target goes to the system log (os_log,
@@ -603,12 +627,12 @@ pub fn run() {
                 .level(log::LevelFilter::Info)
                 .level_for("mumbo_lib", log::LevelFilter::Debug)
                 .level_for("mumble_protocol", log::LevelFilter::Debug)
-                .with_colors(ColoredLevelConfig::default())
+                .format(|out, message, _| out.finish(*message))
                 // The file goes first: fern writes to targets in order, so a
                 // later target failing can't keep a line out of the log file.
                 .targets([
-                    Target::new(TargetKind::LogDir { file_name: None }),
-                    console,
+                    Target::new(TargetKind::LogDir { file_name: None }).format(log_format(false)),
+                    console.format(log_format(std::io::stdout().is_terminal())),
                 ])
                 .build(),
         )
