@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::io::Error;
+use std::io::{Error, Write};
 
 use mumble_protocol as proto;
 use mumble_protocol::client::{Connection, ConnectionOptions, SelfMuteStatus};
 use tauri::{Emitter, Listener, Manager};
 use tauri::ipc::Channel;
-use tauri_plugin_log::fern::colors::ColoredLevelConfig;
+use tauri_plugin_log::fern::{self, colors::ColoredLevelConfig};
+use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_store::StoreExt;
 use tokio::sync::{broadcast, watch};
 
@@ -558,11 +559,33 @@ fn soft_clip(sample: f32) -> f32 {
     bent.copysign(sample)
 }
 
+/// Logs to stdout, dropping lines that can't be written.
+///
+/// The plugin's `TargetKind::Stdout` reports write errors to fern, which then
+/// tries stderr and panics if that fails too. That happens whenever the app
+/// was started with stdout/stderr piped to a process that has since exited
+/// (e.g. launched from Warehouse, then Warehouse closed): `Broken pipe`, and
+/// with `panic = "abort"` the whole app goes down.
+#[cfg(desktop)]
+fn stdout_ignoring_errors() -> fern::Dispatch {
+    fern::Dispatch::new().chain(fern::Output::call(|record| {
+        let _ = writeln!(std::io::stdout().lock(), "{}", record.args());
+    }))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // On mobile the plugin's Stdout target goes to the system log (os_log,
+    // logcat), not a pipe, so keep it there.
+    #[cfg(desktop)]
+    let console = Target::new(TargetKind::Dispatch(stdout_ignoring_errors()));
+    #[cfg(mobile)]
+    let console = Target::new(TargetKind::Stdout);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::new().build())
         .setup(|app| {
+            log::info!("mumbo {} starting", app.package_info().version);
             let store = app.store(SETTINGS_FILE)?;
             let saved = audio::SavedPreferences::from_stored(store.get(AUDIO_SETTINGS_KEY));
             let audio_module = audio::AudioModule::new(saved)?;
@@ -581,6 +604,12 @@ pub fn run() {
                 .level_for("mumbo_lib", log::LevelFilter::Debug)
                 .level_for("mumble_protocol", log::LevelFilter::Debug)
                 .with_colors(ColoredLevelConfig::default())
+                // The file goes first: fern writes to targets in order, so a
+                // later target failing can't keep a line out of the log file.
+                .targets([
+                    Target::new(TargetKind::LogDir { file_name: None }),
+                    console,
+                ])
                 .build(),
         )
         .invoke_handler(tauri::generate_handler![
